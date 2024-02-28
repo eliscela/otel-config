@@ -1,0 +1,297 @@
+---
+apiVersion: opentelemetry.io/v1alpha1
+kind: OpenTelemetryCollector
+metadata:
+  name: gateway
+  namespace: otel
+spec:
+  mode: daemonset
+  volumeMounts:
+    - name: varlogpods
+      mountPath: /var/log/pods
+      readOnly: true
+    - name: varlogcontainers
+      mountPath: /var/log/containers
+      readOnly: true
+  volumes:
+    - name: varlogpods
+      hostPath:
+        path: /var/log/pods
+    - name: varlogcontainers
+      hostPath:
+        path: /var/log/containers
+  serviceAccount: gateway-collector-sa
+  env:
+    - name: K8S_NODE_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: spec.nodeName
+  config: |
+
+    receivers:
+      kubeletstats:
+        collection_interval: 10s
+        auth_type: 'serviceAccount'
+        endpoint: 'https://${K8S_NODE_NAME}:10250'
+        insecure_skip_verify: true
+        metric_groups:
+          - node
+          - pod
+          - container
+      filelog:
+        include:
+          - /var/log/pods/*/*/*.log
+        exclude:
+        # Exclude logs from otel components
+        - /var/log/pods/otel_*/*/*.log
+        - /var/log/containers/otel-*.log
+        include_file_name: false
+        include_file_path: true
+        operators:
+          # Find out which format is used by kubernetes
+          - type: router
+            id: get-format
+            routes:
+              - output: parser-docker
+                expr: 'body matches "^\\{"'
+              - output: parser-crio
+                expr: 'body matches "^[^ Z]+ "'
+              - output: parser-containerd
+                expr: 'body matches "^[^ Z]+Z"'
+          # Parse CRI-O format
+          - type: regex_parser
+            id: parser-crio
+            regex: '^(?P<time>[^ Z]+) (?P<stream>stdout|stderr) (?P<logtag>[^ ]*) ?(?P<log>.*)$'
+            output: extract_metadata_from_filepath
+            timestamp:
+              parse_from: attributes.time
+              layout_type: gotime
+              layout: '2006-01-02T15:04:05.999999999Z07:00'
+          # Parse CRI-Containerd format
+          - type: regex_parser
+            id: parser-containerd
+            regex: '^(?P<time>[^ ^Z]+Z) (?P<stream>stdout|stderr) (?P<logtag>[^ ]*) ?(?P<log>.*)$'
+            output: extract_metadata_from_filepath
+            timestamp:
+              parse_from: attributes.time
+              layout: '%Y-%m-%dT%H:%M:%S.%LZ'
+          # Parse Docker format
+          - type: json_parser
+            id: parser-docker
+            output: extract_metadata_from_filepath
+            timestamp:
+              parse_from: attributes.time
+              layout: '%Y-%m-%dT%H:%M:%S.%LZ'
+          # Extract metadata from file path
+          - type: regex_parser
+            id: extract_metadata_from_filepath
+            regex: '^.*\/(?P<namespace>[^_]+)_(?P<pod_name>[^_]+)_(?P<uid>[a-f0-9\-]{36})\/(?P<container_name>[^\._]+)\/(?P<restart_count>\d+)\.log$'
+            parse_from: attributes["log.file.path"]
+          # Update body field after finishing all parsing
+          - type: move
+            from: attributes.log
+            to: body
+          # Rename attributes
+          - type: move
+            from: attributes.stream
+            to: attributes["log.iostream"]
+          - type: move
+            from: attributes.container_name
+            to: resource["k8s.container.name"]
+          - type: move
+            from: attributes.namespace
+            to: resource["k8s.namespace.name"]
+          - type: move
+            from: attributes.pod_name
+            to: resource["k8s.pod.name"]
+          - type: move
+            from: attributes.restart_count
+            to: resource["k8s.container.restart_count"]
+          - type: move
+            from: attributes.uid
+            to: resource["k8s.pod.uid"]
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      batch:
+      resource:
+        attributes:
+        - key: host.id
+          from_attribute: host.name
+          action: upsert
+        - key: service.instance.id
+          from_attribute: k8s.pod.uid
+          action: insert
+      resourcedetection/eks:
+        detectors: [env, eks]
+        timeout: 2s
+        override: false
+      k8sattributes:
+        auth_type: "serviceAccount"
+        passthrough: false
+        filter:
+          node_from_env_var: KUBE_NODE_NAME
+        extract:
+          metadata:
+          - k8s.pod.name
+          - k8s.pod.uid
+          - k8s.deployment.name
+          - k8s.node.name
+          - k8s.cluster.uid
+          - k8s.namespace.name
+          - k8s.pod.start_time
+          - k8s.statefulset.name
+          - k8s.daemonset.name
+          - k8s.cronjob.name
+          - k8s.job.name
+        pod_association:
+          - sources:
+            - from: resource_attribute
+              name: k8s.pod.uid
+          - sources:
+            - from: resource_attribute
+              name: k8s.pod.ip
+          - sources:
+            - from: connection
+
+    exporters:
+      debug:
+        verbosity: normal
+      # otlp/newrelic:
+      #   endpoint: $NEWRELIC_URL
+      #   headers:
+      #     api-key: $NEWRELIC_APIKEY
+      # loki:
+      #   auth:
+      #     authenticator: basicauth/logs
+      #   endpoint: $LOGS_URL
+      # otlp/traces:
+      #   auth:
+      #     authenticator: basicauth/traces
+      #   endpoint: $TRACES_URL
+      #   tls:
+      #     insecure: false
+      # prometheusremotewrite:
+      #   auth:
+      #     authenticator: basicauth/metrics
+      #   endpoint: $METRICS_URL
+
+    extensions:
+      # basicauth/logs:
+      #   client_auth:
+      #     password: $GRAFANA_APIKEY
+      #     username: $LOGS_USER
+      # basicauth/metrics:
+      #   client_auth:
+      #     password: $GRAFANA_APIKEY
+      #     username: $METRICS_USER
+      # basicauth/traces:
+      #   client_auth:
+      #     password: $GRAFANA_APIKEY
+      #     username: $TRACES_USER
+      health_check: {}
+      memory_ballast:
+        size_in_percentage: 25
+
+    service:
+      # extensions:
+      # - basicauth/traces
+      # - basicauth/metrics
+      # - basicauth/logs
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [k8sattributes, batch, resourcedetection/eks]
+          # exporters: [otlp/newrelic, otlp/traces, debug]
+          exporters: [debug]
+        metrics:
+          receivers: [otlp, kubeletstats]
+          processors: [k8sattributes, batch, resourcedetection/eks]
+          # exporters: [otlp/newrelic, prometheusremotewrite, debug]
+          exporters: [debug]
+        logs:
+          receivers: [otlp, filelog]
+          processors: [k8sattributes, batch, resourcedetection/eks]
+          # exporters: [otlp/newrelic, loki, debug]
+          exporters: [debug]
+---
+apiVersion: opentelemetry.io/v1alpha1
+kind: Instrumentation
+metadata:
+  name: instrumentation
+  namespace: otel
+spec:
+  exporter:
+    endpoint: "http://gateway-collector.otel.svc.cluster.local:4317"
+  propagators:
+    - tracecontext
+    - baggage
+    - b3
+  sampler:
+    type: parentbased_traceidratio
+    argument: "0.5"
+  java:
+    env:
+      - name: OTEL_INSTRUMENTATION_KAFKA_ENABLED
+        value: 'true'
+      - name: OTEL_INSTRUMENTATION_REDISCALA_ENABLED
+        value: 'true'
+  nodejs:
+    env:
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://gateway-collector.otel.svc.cluster.local:4317
+  python:
+    env:
+      # - name: OTEL_LOGS_EXPORTER
+      #   value: otlp_proto_http
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://gateway-collector.otel.svc.cluster.local:4318
+  dotnet:
+    env:
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://gateway-collector.otel.svc.cluster.local:4318
+  go:
+    env:
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://gateway-collector.otel.svc.cluster.local:4318
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gateway-collector-crb
+  namespace: otel
+subjects:
+- kind: ServiceAccount
+  name: gateway-collector-sa
+  namespace: otel
+roleRef:
+  kind: ClusterRole
+  name: gateway-collector-cr
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gateway-collector-sa
+  namespace: otel
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gateway-collector-cr
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["aws-auth"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes/stats", "nodes/metrics"]
+    verbs: ["get", "list", "watch"]
